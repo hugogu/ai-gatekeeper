@@ -3,6 +3,7 @@ import json
 import os
 import logging
 import requests as http_requests
+import socket
 import hashlib
 from datetime import datetime, timezone
 from aliyun.log import LogClient
@@ -13,6 +14,13 @@ APACHE_LOG_REGEX = r'(\S+) (\S+) (\S+) \[(.*?)\] "(\S+) (\S+) (\S+)" (\d+) (\d+)
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+# 配置风险日志记录器
+risk_logger = logging.getLogger('security_risk')
+risk_logger.setLevel(logging.WARNING)
+
+# 获取主机名
+HOSTNAME = socket.gethostname()
 
 # 聚合分析配置
 MIN_REQUESTS_FOR_ANALYSIS = 2  # 触发分析的最小请求数
@@ -76,6 +84,38 @@ def extract_json_from_response(content):
         "is_abnormal": False,
         "reason": f"无法解析API响应: {content[:200]}{'...' if len(content) > 200 else ''}"
     }
+
+def log_security_risk(ip, risk_level, reason, patterns_found, request_count, analysis_result=None):
+    """
+    记录安全风险日志，用于SLS告警
+    :param ip: 风险IP地址
+    :param risk_level: 风险等级 (low/medium/high)
+    :param reason: 风险原因
+    :param patterns_found: 检测到的风险模式列表
+    :param request_count: 相关请求数量
+    :param analysis_result: 完整分析结果(可选)
+    """
+    risk_data = {
+        "__source__": HOSTNAME,
+        "__tag__:risk_type": "ai_anomaly_detection",
+        "risk_level": risk_level,
+        "ip": ip,
+        "reason": reason,
+        "patterns_found": ", ".join(patterns_found) if patterns_found else "none",
+        "request_count": request_count,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    
+    if analysis_result:
+        risk_data["analysis_result"] = str(analysis_result)
+    
+    # 使用WARNING级别记录，便于在SLS中配置告警
+    risk_logger.warning(
+        "SECURITY_RISK_DETECTED",
+        extra={"risk_data": risk_data}
+    )
+    
+    logger.warning(f"安全风险已记录 - IP: {ip}, 风险等级: {risk_level}, 原因: {reason}")
 
 def analyze_ip_behavior(ip, ip_requests):
     """
@@ -182,6 +222,8 @@ IP地址: {ip}
 
 # 主处理函数
 def handler(event, context):
+
+    logger.info(f"开始处理访问日志：{event}")
     # 记录处理开始时间
     processing_start = datetime.now(timezone.utc)
     
@@ -250,6 +292,17 @@ def handler(event, context):
             result = analyze_ip_behavior(ip, sorted_requests)
             analysis_results.append((ip, result))
             logger.info(f"IP分析结果: {ip}, 结果: {result}")
+            
+            # 如果检测到异常行为，记录风险日志
+            if result.get('is_abnormal', False):
+                log_security_risk(
+                    ip=ip,
+                    risk_level=result.get('risk_level', 'medium'),
+                    reason=result.get('reason', '检测到可疑行为'),
+                    patterns_found=result.get('patterns_found', []),
+                    request_count=len(sorted_requests),
+                    analysis_result=result
+                )
         else:
             logger.info(f"跳过IP {ip} 分析，请求数不足: {len(requests)} < {MIN_REQUESTS_FOR_ANALYSIS}")
 
