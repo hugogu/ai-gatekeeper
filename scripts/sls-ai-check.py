@@ -85,7 +85,7 @@ def extract_json_from_response(content):
         "reason": f"无法解析API响应: {content[:200]}{'...' if len(content) > 200 else ''}"
     }
 
-def log_security_risk(ip, risk_level, reason, patterns_found, request_count, analysis_result=None):
+def log_security_risk(ip, risk_level, reason, patterns_found, request_count, analysis_result=None, original_requests=None):
     """
     记录安全风险日志，用于SLS告警
     :param ip: 风险IP地址
@@ -94,6 +94,7 @@ def log_security_risk(ip, risk_level, reason, patterns_found, request_count, ana
     :param patterns_found: 检测到的风险模式列表
     :param request_count: 相关请求数量
     :param analysis_result: 完整分析结果(可选)
+    :param original_requests: 原始请求数据列表(可选)
     """
     risk_data = {
         "__source__": HOSTNAME,
@@ -109,6 +110,20 @@ def log_security_risk(ip, risk_level, reason, patterns_found, request_count, ana
     if analysis_result:
         risk_data["analysis_result"] = str(analysis_result)
     
+    # 添加原始请求数据，最多包含10个请求，以便人工审核
+    if original_requests:
+        # 提取请求的关键信息并格式化为易读的字符串
+        request_details = []
+        for i, req in enumerate(original_requests[:10]):
+            time_str = req['time'].strftime('%Y-%m-%d %H:%M:%S %Z')
+            request_details.append(f"#{i+1}: {req['method']} {req['path']} - {req['status']} - {time_str} - {req['user_agent'][:50]}...")
+        
+        # 如果有更多请求，添加提示信息
+        if len(original_requests) > 10:
+            request_details.append(f"...还有 {len(original_requests) - 10} 个请求未显示")
+            
+        risk_data["request_details"] = request_details
+    
     # 使用WARNING级别记录，便于在SLS中配置告警
     risk_logger.warning(
         "SECURITY_RISK_DETECTED",
@@ -123,10 +138,16 @@ def analyze_ip_behavior(ip, ip_requests):
     :param ip: 客户端IP
     :param ip_requests: 该IP的请求列表（每个请求是解析后的日志字典）
     """
-    # 构建提示词 - 关注多个请求的模式
+    # 构建提示词 - 关注多个请求的模式，并提供更多正常行为的指导
     prompt = f"""
 你是一个高级网络安全分析系统，请分析以下来自同一IP地址的多个访问行为是否异常（如扫描、暴力破解、爬虫等）。
 重点关注请求模式、路径分布、频率等特征。
+
+请注意区分正常的网页浏览行为与恶意行为：
+- 正常浏览行为：用户访问一个页面，然后加载该页面的CSS、JS、图片等资源，通常在同一时间点有多个请求
+- 可疑的扫描行为：短时间内访问大量不相关的页面或资源，特别是访问大量不存在的资源(404)
+- 可疑的暴力破解：对登录、管理页面进行大量重复访问，特别是返回401/403状态码
+- 可疑的爬虫行为：系统性地访问网站的所有内容，但与正常浏览不同的是，爬虫通常不会加载CSS/JS等资源
 
 IP地址: {ip}
 请求数量: {len(ip_requests)}
@@ -154,34 +175,69 @@ IP地址: {ip}
     unique_paths = len(set(req['path'] for req in ip_requests))
     status_codes = [req['status'] for req in ip_requests]
     success_rate = sum(1 for code in status_codes if 200 <= code < 300) / len(status_codes) if status_codes else 0
+    error_rate = sum(1 for code in status_codes if code >= 400) / len(status_codes) if status_codes else 0
     
-    # 获取时间范围字符串
+    # 计算请求时间分布
     if ip_requests:
-        first_time = ip_requests[0]['time'].strftime('%H:%M:%S %Z')
-        last_time = ip_requests[-1]['time'].strftime('%H:%M:%S %Z')
-        time_range = f"{first_time} - {last_time}"
+        request_times = [req['time'] for req in ip_requests]
+        first_time = min(request_times)
+        last_time = max(request_times)
+        time_range_str = f"{first_time.strftime('%H:%M:%S %Z')} - {last_time.strftime('%H:%M:%S %Z')}"
+        
+        # 计算请求的时间跨度（秒）
+        time_span_seconds = (last_time - first_time).total_seconds()
+        
+        # 如果所有请求都在同一秒内，这很可能是正常的页面加载
+        same_second = time_span_seconds < 1
     else:
-        time_range = "N/A"
+        time_range_str = "N/A"
+        time_span_seconds = 0
+        same_second = False
+    
+    # 分析请求路径模式
+    paths = [req['path'] for req in ip_requests]
+    # 检查是否有主页面和相关资源的模式（正常浏览行为）
+    has_page_and_resources = False
+    resource_extensions = [".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2", ".ttf"]
+    
+    # 计算资源请求的比例
+    resource_requests = sum(1 for path in paths if any(path.endswith(ext) for ext in resource_extensions))
+    resource_ratio = resource_requests / len(paths) if paths else 0
+    
+    # 检查是否有明显的页面和资源加载模式
+    if resource_ratio > 0.5 and same_second:
+        has_page_and_resources = True
     
     prompt += f"""
 统计分析:
 - 请求总数: {len(ip_requests)}
 - 唯一路径数: {unique_paths}
 - 成功率: {success_rate:.1%}
-- 时间范围: {time_range}
+- 错误率: {error_rate:.1%}
+- 时间范围: {time_range_str}
+- 时间跨度: {time_span_seconds:.1f}秒
+- 资源请求比例: {resource_ratio:.1%}
+- 所有请求在同一秒内: {'是' if same_second else '否'}
+- 疑似正常页面加载模式: {'是' if has_page_and_resources else '否'}
 
 请从以下角度分析:
-1. 是否存在扫描行为（如请求大量不同路径）
-2. 是否存在暴力破解特征（如大量登录尝试）
-3. 是否表现出爬虫行为模式
-4. 其他可疑模式
+1. 是否存在扫描行为（如请求大量不同路径，特别是大量404响应）
+2. 是否存在暴力破解特征（如对登录页面的大量请求，特别是401/403响应）
+3. 是否表现出爬虫行为模式（系统性地访问内容但不加载资源文件）
+4. 是否符合正常用户浏览网页的模式（加载页面后立即加载相关资源）
+
+重要提示：
+- 如果请求模式符合正常的网页浏览（页面加载后立即加载CSS/JS等资源），即使请求数量较多，也应判定为正常行为
+- 只有在明确存在恶意模式时才标记为异常
+- 高成功率、资源请求比例高、同一秒内的多个请求通常表示正常的页面加载
 
 返回JSON格式:
 {{
-  "is_abnormal": true/false,
+  "is_abnormal": true/false,  // 只有在确信是恶意行为时才设为true
   "risk_level": "low/medium/high",
   "reason": "详细分析原因",
-  "patterns_found": ["扫描", "暴力破解", "爬虫", "其他"]  // 检测到的模式列表
+  "patterns_found": ["扫描", "暴力破解", "爬虫", "其他"],  // 检测到的模式列表
+  "suspicious_requests": [{{"path": "路径", "method": "方法", "status": "状态码", "time": "时间"}}]  // 可疑请求列表
 }}
 """
     
@@ -210,14 +266,43 @@ IP地址: {ip}
         logger.info(f"DeepSeek API调用成功，返回结果: {result}")
         
         content = result['choices'][0]['message']['content'].strip()
-        return extract_json_from_response(content)
+        ai_result = extract_json_from_response(content)
+        
+        # 添加请求统计信息
+        ai_result['request_stats'] = {
+            "total_requests": len(ip_requests),
+            "unique_paths": unique_paths,
+            "success_rate": f"{success_rate:.1%}",
+            "error_rate": f"{error_rate:.1%}",
+            "time_span_seconds": f"{time_span_seconds:.1f}",
+            "resource_ratio": f"{resource_ratio:.1%}",
+            "same_second_requests": same_second,
+            "likely_normal_browsing": has_page_and_resources
+        }
+        
+        # 添加原始请求数据的引用，但不直接包含在结果中（避免结果过大）
+        ai_result['has_original_requests'] = True
+        
+        return ai_result
     except Exception as e:
         logger.error(f"DeepSeek API调用失败: {str(e)}")
         return {
             "is_abnormal": False,
             "risk_level": "unknown",
             "reason": f"API调用失败: {str(e)}",
-            "patterns_found": []
+            "patterns_found": [],
+            "suspicious_requests": [],
+            "request_stats": {
+                "total_requests": len(ip_requests),
+                "unique_paths": unique_paths,
+                "success_rate": f"{success_rate:.1%}",
+                "error_rate": f"{error_rate:.1%}",
+                "time_span_seconds": f"{time_span_seconds:.1f}",
+                "resource_ratio": f"{resource_ratio:.1%}",
+                "same_second_requests": same_second,
+                "likely_normal_browsing": has_page_and_resources
+            },
+            "has_original_requests": True
         }
 
 # 主处理函数
@@ -301,7 +386,8 @@ def handler(event, context):
                     reason=result.get('reason', '检测到可疑行为'),
                     patterns_found=result.get('patterns_found', []),
                     request_count=len(sorted_requests),
-                    analysis_result=result
+                    analysis_result=result,
+                    original_requests=sorted_requests  # 传入原始请求数据，而不是依赖AI返回值
                 )
         else:
             logger.info(f"跳过IP {ip} 分析，请求数不足: {len(requests)} < {MIN_REQUESTS_FOR_ANALYSIS}")
